@@ -1,23 +1,21 @@
-#include <corecrt.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 
-typedef struct {
-    size_t    readed;
-    FILE       *fptr;
-    size_t       len;
-    char       *path;
-    uint8_t *content;
-} FileInfo;
+#include "structs.h"
 
-errno_t loadFile(FileInfo **file, char *path);
-void freeFileInfo(FileInfo *file);
+#define SECTOR_LEN 2048
+
+errno_t loadFile(FileInfo_t **file, char *path);
+void freeFileInfo(FileInfo_t *file);
+errno_t getVolumeDescriptor(VolDescriptor_t **vd, uint8_t *initOfVD);
 
 int main(int argc, char **argv) {
-    FileInfo *sourcefile = NULL;
+    FileInfo_t *sourcefile = NULL;
+    VolDescriptor_t *primary_vd = NULL;
+
     if (argc < 2) {
         fprintf(stderr, "Erro: Uso correto: %s <arquivo_origem>\n", argv[0]);
         return EINVAL;
@@ -34,28 +32,40 @@ int main(int argc, char **argv) {
 
     fwrite(sourcefile->content, sizeof(uint8_t), sourcefile->readed, destinefile);
 
-    FILE *headerFile = NULL;
-    err = fopen_s(&headerFile, "header.bin", "wb");
+    // FILE *headerFile = NULL;
+    // err = fopen_s(&headerFile, "header.bin", "wb");
+    // if (err != 0) {
+    //     freeFileInfo(sourcefile);
+    //     return err;
+    // }
+    // fwrite(&(sourcefile->content[16 * SECTOR_LEN]), sizeof(uint8_t), 1 * SECTOR_LEN, headerFile);
+    // fclose(headerFile);
+
+    err = getVolumeDescriptor(&primary_vd, &(sourcefile->content[16 * SECTOR_LEN]));
     if (err != 0) {
+        fprintf(stderr, "Erro ao ler Volume Descriptor: %d\n", err);
+        fclose(destinefile);
         freeFileInfo(sourcefile);
         return err;
     }
-    fwrite(sourcefile->content, sizeof(uint8_t), 32 * 1024, headerFile);
-    fclose(headerFile);
+
+    printf("Type: %d\nIdentifier: %s\nVersion: %d\n", primary_vd->type, primary_vd->identifier, primary_vd->version);
 
     fclose(destinefile);
     freeFileInfo(sourcefile);
     return EXIT_SUCCESS;
 }
 
-errno_t loadFile(FileInfo **file, char *path) {
+// --------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+errno_t loadFile(FileInfo_t **file, char *path) {
     errno_t err;
     if (path == NULL) {
         return EINVAL;
     }
 
-    *file = (FileInfo *)malloc(sizeof(FileInfo));
-    if (file == NULL) {
+    *file = (FileInfo_t *)malloc(sizeof(FileInfo_t));
+    if (*file == NULL) {
         return ENOMEM;
     }
 
@@ -88,9 +98,29 @@ errno_t loadFile(FileInfo **file, char *path) {
     return 0;
 }
 
-void freeFileInfo(FileInfo *file) {
+void freeFileInfo(FileInfo_t *file) {
     free(file->content);
     fclose(file->fptr);
     free(file->path);
     free(file);
+}
+
+errno_t getVolumeDescriptor(VolDescriptor_t **vd, uint8_t *initOfVD) {
+    errno_t err;
+
+    if (initOfVD == NULL) {
+        return EINVAL;
+    }
+
+    *vd = (VolDescriptor_t *)malloc(sizeof(VolDescriptor_t));
+    if (*vd == NULL) {
+        return ENOMEM;
+    }
+
+    (*vd)->type = initOfVD[0];
+    memcpy_s((*vd)->identifier, sizeof((*vd)->identifier), &initOfVD[1], 5);
+    (*vd)->identifier[5] = '\0';
+    (*vd)->version = initOfVD[6];
+    memcpy_s((*vd)->data, sizeof((*vd)->data), &initOfVD[7], sizeof((*vd)->data));
+    return EXIT_SUCCESS;
 }
