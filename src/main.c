@@ -1,20 +1,85 @@
+#include <corecrt.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 
-#include "structs.h"
+#include "headers.h"
 
-#define SECTOR_LEN 2048
+typedef struct FileInfo {
+    size_t    readed;
+    FILE       *fptr;
+    size_t       len;
+    char       *path;
+    uint8_t *content;
+} FileInfo_t;
 
 errno_t loadFile(FileInfo_t **file, char *path);
 void freeFileInfo(FileInfo_t *file);
-errno_t getVolumeDescriptor(VolDescriptor_t **vd, uint8_t *initOfVD);
+
+static void logText(const char *label, const uint8_t *data, size_t size)
+{
+    printf("  %-20s: %.*s\n",
+           label, (int)size, (const char *)data);
+}
+
+void logVolumeDescriptor(const VolDescriptor_t *vd)
+{
+    if (vd == NULL) {
+        printf("[VolumeDescriptor] NULL\n");
+        return;
+    }
+
+    printf("\n========== Volume Descriptor ==========\n");
+    printf("Type:    %u\n", (unsigned)vd->header.type);
+    logText("Identifier", vd->header.id, sizeof(vd->header.id));
+    printf("Version: %u\n", (unsigned)vd->header.version);
+
+    switch (vd->header.type) {
+        case DESCRIPTOR_BOOT_RECORD:
+            printf("\n-- Boot Record --\n");
+            logText("Boot system ID",
+                    vd->data.boot_record.boot_system_id, 32);
+            logText("Boot ID",
+                    vd->data.boot_record.boot_id, 32);
+            break;
+
+        case DESCRIPTOR_PRIMARY:
+            printf("\n-- Primary Volume Descriptor --\n");
+            logText("System ID",
+                    vd->data.primary.system_id, 32);
+            logText("Volume ID",
+                    vd->data.primary.v_id, 32);
+            logText("Volume set ID",
+                    vd->data.primary.v_set_id, 128);
+            logText("Publisher ID",
+                    vd->data.primary.publisher_id, 128);
+            logText("Application ID",
+                    vd->data.primary.application_id, 128);
+
+            printf("  Logical block size  : %u (raw first byte)\n",
+                   (unsigned)vd->data.primary.logical_block_size[0]);
+
+            break;
+
+        case DESCRIPTOR_SET_TERMINATOR:
+            printf("\n-- Volume Set Terminator --\n");
+            printf("  No additional fields to display.\n");
+            break;
+
+        default:
+            printf("\nUnknown descriptor type.\n");
+            break;
+    }
+
+    printf("=======================================\n\n");
+}
 
 int main(int argc, char **argv) {
+    errno_t err;
     FileInfo_t *sourcefile = NULL;
-    VolDescriptor_t *primary_vd = NULL;
+    VolDescriptor_t my_first_vd;
 
     if (argc < 2) {
         fprintf(stderr, "Erro: Uso correto: %s <arquivo_origem>\n", argv[0]);
@@ -23,40 +88,32 @@ int main(int argc, char **argv) {
 
     loadFile(&sourcefile, argv[1]);
 
-    FILE *destinefile = NULL;
-    errno_t err = fopen_s(&destinefile, "destine.bin", "wb");
-    if (err != 0) {
-        freeFileInfo(sourcefile);
-        return err;
-    }
+    ByteCursor_t cursor = {
+        .ptr = sourcefile->content,
+        .remaining = sourcefile->readed
+    };
 
-    fwrite(sourcefile->content, sizeof(uint8_t), sourcefile->readed, destinefile);
+    cursor.ptr += 16 * SECTOR_LEN;
+    cursor.remaining -= 16 * SECTOR_LEN;
 
-    // FILE *headerFile = NULL;
-    // err = fopen_s(&headerFile, "header.bin", "wb");
-    // if (err != 0) {
-    //     freeFileInfo(sourcefile);
-    //     return err;
-    // }
-    // fwrite(&(sourcefile->content[16 * SECTOR_LEN]), sizeof(uint8_t), 1 * SECTOR_LEN, headerFile);
-    // fclose(headerFile);
-
-    err = getVolumeDescriptor(&primary_vd, &(sourcefile->content[16 * SECTOR_LEN]));
+    err = getVolumeDescriptor(&my_first_vd, &cursor);
     if (err != 0) {
         fprintf(stderr, "Erro ao ler Volume Descriptor: %d\n", err);
-        fclose(destinefile);
         freeFileInfo(sourcefile);
         return err;
     }
 
-    printf("Type: %d\nIdentifier: %s\nVersion: %d\n", primary_vd->type, primary_vd->identifier, primary_vd->version);
+    logVolumeDescriptor(&my_first_vd);
 
-    fclose(destinefile);
+    printf("Volume set ID: %.*s\n",
+           (int)sizeof(vd->data.primary.v_set_id),
+           (const char *)vd->data.primary.v_set_id);
+
     freeFileInfo(sourcefile);
     return EXIT_SUCCESS;
 }
 
-// --------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 errno_t loadFile(FileInfo_t **file, char *path) {
     errno_t err;
@@ -103,24 +160,4 @@ void freeFileInfo(FileInfo_t *file) {
     fclose(file->fptr);
     free(file->path);
     free(file);
-}
-
-errno_t getVolumeDescriptor(VolDescriptor_t **vd, uint8_t *initOfVD) {
-    errno_t err;
-
-    if (initOfVD == NULL) {
-        return EINVAL;
-    }
-
-    *vd = (VolDescriptor_t *)malloc(sizeof(VolDescriptor_t));
-    if (*vd == NULL) {
-        return ENOMEM;
-    }
-
-    (*vd)->type = initOfVD[0];
-    memcpy_s((*vd)->identifier, sizeof((*vd)->identifier), &initOfVD[1], 5);
-    (*vd)->identifier[5] = '\0';
-    (*vd)->version = initOfVD[6];
-    memcpy_s((*vd)->data, sizeof((*vd)->data), &initOfVD[7], sizeof((*vd)->data));
-    return EXIT_SUCCESS;
 }

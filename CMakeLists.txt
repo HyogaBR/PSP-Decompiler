@@ -7,6 +7,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_executable(${PROJECT_NAME}
   src/main.c
+  src/headers.c
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
