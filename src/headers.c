@@ -1,207 +1,288 @@
-#include <corecrt.h>
 #include <errno.h>
-#include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "headers.h"
+#include "cursor.h"
 
-#define READ_FIELD(dst, cursor, err)                    \
-    do {                                                \
-        size_t fieldSize = sizeof(dst);                 \
-                                                        \
-        if ((cursor).remaining < fieldSize) {           \
-            return EINVAL;                              \
-        }                                               \
-                                                        \
-        (err) = memcpy_s(                               \
-            (dst),                                      \
-            sizeof(dst),                                \
-            (cursor).ptr,                               \
-            fieldSize                                   \
-        );                                              \
-                                                        \
-        if ((err) != 0) {                               \
-            return (err);                               \
-        }                                               \
-                                                        \
-        (cursor).ptr += fieldSize;                      \
-        (cursor).remaining -= fieldSize;                \
+#define READ_VALUE(dst, cursor, err)                                    \
+    do {                                                                \
+        (err) = cursor_read((cursor), sizeof((dst)), (byte *)&(dst));   \
+        if ((err) != 0) goto cleanup;                                     \
     } while (0)
 
-#define READ_VALUE(dst, cursor, err)                    \
-    do {                                                \
-        size_t fieldSize = sizeof(dst);                 \
-        if ((cursor).remaining < fieldSize) {           \
-            return EINVAL;                              \
-        }                                               \
-        (err) = memcpy_s(                               \
-            &(dst),                                     \
-            sizeof(dst),                                \
-            (cursor).ptr,                               \
-            fieldSize                                   \
-        );                                              \
-        if ((err) != 0) {                               \
-            return (err);                               \
-        }                                               \
-        (cursor).ptr += fieldSize;                      \
-        (cursor).remaining -= fieldSize;                \
-    } while (0)
+#define COPY_VALUE(dst, src, err)                               \
+    do {                                                        \
+    memset(&(dst), 0, sizeof((dst)));                           \
+    (err) = memcpy_s(&(dst), sizeof(dst), &(src), sizeof(src)); \
+    if ((err) != 0) goto cleanup;                                 \
+    } while(0)
 
+
+errno_t getDescriptorHeaderISO(
+    DescriptorHeaderISO_t *header,
+    ByteCursor_t *cur
+) {
+    errno_t err = 0;
+    if (header == NULL || cur == NULL) return EINVAL;
+
+    ByteCursor_t *cursor = cursor_fork(cur);
+    if (cursor == NULL) {
+        err = ENOMEM;
+        goto cleanup;
+    }
+
+    READ_VALUE(*header, cursor, err);
+
+    err = cursor_merge(cur, cursor);
+
+    cleanup:
+    cursor_close(cursor);
+    return err;
+}
+
+errno_t getDescriptorDataISO(
+    DescriptorDataISO_t *data,
+    DescriptorType_t dataType,
+    ByteCursor_t *cur
+) {
+    errno_t err = 0;
+    if (data == NULL || cur == NULL) return EINVAL;
+
+    ByteCursor_t *cursor = cursor_fork(cur);
+    if (cursor == NULL) {
+        err = ENOMEM;
+        goto cleanup;
+    }
+
+    switch (dataType) {
+        case DESCRIPTOR_BOOT_RECORD:
+            READ_VALUE(data->boot_record, cursor, err);
+            break;
+        case DESCRIPTOR_PRIMARY:
+            READ_VALUE(data->primary, cursor, err);
+            break;
+        case DESCRIPTOR_SET_TERMINATOR:
+            READ_VALUE(data->set_terminator, cursor, err);
+            break;
+        default:
+            err = EINVAL;
+            goto cleanup;
+    }
+
+    err = cursor_merge(cur, cursor);
+
+    cleanup:
+    cursor_close(cursor);
+    return err;
+}
+
+errno_t getDescriptorDateTimeISO(
+    DescriptorDateTimeISO_t *dt,
+    ByteCursor_t *cur
+) {
+    errno_t err = 0;
+    if (dt == NULL || cur == NULL) return EINVAL;
+
+    ByteCursor_t *cursor = cursor_fork(cur);
+    if (cursor == NULL) {
+        err = ENOMEM;
+        goto cleanup;
+    }
+
+    READ_VALUE(*dt, cursor, err);
+
+    err = cursor_merge(cur, cursor);
+
+    cleanup:
+    cursor_close(cursor);
+    return err;
+}
+
+errno_t getDescriptorHeader(
+    DescriptorHeader_t *header,
+    ByteCursor_t *cur
+) {
+    errno_t err = 0;
+    if (header == NULL || cur == NULL) return EINVAL;
+
+
+    ByteCursor_t *cursor = cursor_fork(cur);
+    if (cursor == NULL) {
+        err = ENOMEM;
+        goto cleanup;
+    }
+
+    DescriptorHeaderISO_t headerISO;
+    err = getDescriptorHeaderISO(&headerISO, cursor);
+    if (err != 0) goto cleanup;
+
+    DescriptorHeader_t tempHd = {0};
+
+    COPY_VALUE(tempHd.type, headerISO.type, err);
+    COPY_VALUE(tempHd.id, headerISO.id, err);
+    COPY_VALUE(tempHd.version, headerISO.version, err);
+
+    err = cursor_merge(cur, cursor);
+    if (err != 0) goto cleanup;
+
+    *header = tempHd;
+
+    cleanup:
+    cursor_close(cursor);
+    return err;
+}
+
+errno_t getDescriptorData(
+    DescriptorData_t *data,
+    DescriptorType_t dataType,
+    ByteCursor_t *cur
+) {
+    errno_t err = 0;
+    if (data == NULL || cur == NULL) return EINVAL;
+
+    ByteCursor_t *cursor = cursor_fork(cur);
+    if (cursor == NULL) {
+        err = ENOMEM;
+        goto cleanup;
+    }
+
+    DescriptorDataISO_t dataISO;
+    err = getDescriptorDataISO(&dataISO, dataType, cursor);
+    if (err != 0) goto cleanup;
+
+    DescriptorData_t tempData = {0};
+
+    switch (dataType) {
+        case DESCRIPTOR_BOOT_RECORD:
+            COPY_VALUE(tempData.boot_record.system_id, dataISO.boot_record.system_id, err);
+            COPY_VALUE(tempData.boot_record.id, dataISO.boot_record.id, err);
+            COPY_VALUE(tempData.boot_record.system_use, dataISO.boot_record.system_use, err);
+            break;
+
+        case DESCRIPTOR_PRIMARY:
+            COPY_VALUE(tempData.primary.system_id, dataISO.primary.system_id, err);
+            COPY_VALUE(tempData.primary.v_id, dataISO.primary.v_id, err);
+            COPY_VALUE(tempData.primary.v_space_size, dataISO.primary.v_space_size, err);
+            COPY_VALUE(tempData.primary.v_set_size, dataISO.primary.v_set_size, err);
+            COPY_VALUE(tempData.primary.v_sequence_number, dataISO.primary.v_sequence_number, err);
+            COPY_VALUE(tempData.primary.logical_block_size, dataISO.primary.logical_block_size, err);
+            COPY_VALUE(tempData.primary.path_table_size, dataISO.primary.path_table_size, err);
+            COPY_VALUE(tempData.primary.location_path_table, dataISO.primary.location_typeL_path_table, err);
+            COPY_VALUE(tempData.primary.location_opt_path_table, dataISO.primary.location_opt_typeL_path_table, err);
+            COPY_VALUE(tempData.primary.direntry_root, dataISO.primary.direntry_root, err);
+            COPY_VALUE(tempData.primary.v_set_id, dataISO.primary.v_set_id, err);
+            COPY_VALUE(tempData.primary.publisher_id, dataISO.primary.publisher_id, err);
+            COPY_VALUE(tempData.primary.data_preparer_id, dataISO.primary.data_preparer_id, err);
+            COPY_VALUE(tempData.primary.application_id, dataISO.primary.application_id, err);
+            COPY_VALUE(tempData.primary.copyright_file_id, dataISO.primary.copyright_file_id, err);
+            COPY_VALUE(tempData.primary.abstract_file_id, dataISO.primary.abstract_file_id, err);
+            COPY_VALUE(tempData.primary.biographic_file_id, dataISO.primary.biographic_file_id, err);
+            COPY_VALUE(tempData.primary.v_creation_date_time, dataISO.primary.v_creation_date_time, err);
+            COPY_VALUE(tempData.primary.v_modification_date_time, dataISO.primary.v_modification_date_time, err);
+            COPY_VALUE(tempData.primary.v_expiration_date_time, dataISO.primary.v_expiration_date_time, err);
+            COPY_VALUE(tempData.primary.v_effective_date_time, dataISO.primary.v_effective_date_time, err);
+            COPY_VALUE(tempData.primary.file_structure_version, dataISO.primary.file_structure_version, err);
+            COPY_VALUE(tempData.primary.application_used, dataISO.primary.application_used, err);
+            COPY_VALUE(tempData.primary.reserved, dataISO.primary.reserved, err);
+            break;
+
+        case DESCRIPTOR_SET_TERMINATOR:
+            COPY_VALUE(tempData.set_terminator._unused, dataISO.set_terminator._unused, err);
+            break;
+
+        default:
+            err = EINVAL;
+            goto cleanup;
+    }
+
+    err = cursor_merge(cur, cursor);
+    if (err != 0) goto cleanup;
+
+    *data = tempData;
+
+    cleanup:
+    cursor_close(cursor);
+    return err;
+}
+
+errno_t getDescriptorDateTime(
+    DescriptorDateTime_t *dt,
+    ByteCursor_t *cur
+) {
+    errno_t err = 0;
+
+    if (dt == NULL || cur == NULL) return EINVAL;
+
+    ByteCursor_t *cursor = cursor_fork(cur);
+    if (cursor == NULL) {
+        err = ENOMEM;
+        goto cleanup;
+    }
+
+    DescriptorDateTimeISO_t dtISO;
+    err = getDescriptorDateTimeISO(&dtISO, cursor);
+    if (err != 0) goto cleanup;
+
+    DescriptorDateTime_t tempDT = {0};
+
+    COPY_VALUE(tempDT.year, dtISO.year, err);
+    COPY_VALUE(tempDT.month, dtISO.month, err);
+    COPY_VALUE(tempDT.day, dtISO.day, err);
+    COPY_VALUE(tempDT.hour, dtISO.hour, err);
+    COPY_VALUE(tempDT.minute, dtISO.minute, err);
+    COPY_VALUE(tempDT.second, dtISO.second, err);
+    COPY_VALUE(tempDT.hundredsec, dtISO.hundredsec, err);
+    COPY_VALUE(tempDT.timezone, dtISO.timezone, err);
+
+    err = cursor_merge(cur, cursor);
+    if (err != 0) goto cleanup;
+
+    *dt = tempDT;
+
+    cleanup:
+    cursor_close(cursor);
+    return err;
+}
 
 errno_t getVolumeDescriptor(
     VolDescriptor_t *vd,
     ByteCursor_t *cur
 ) {
+    errno_t err = 0;
+    if (cur == NULL || vd == NULL) return EINVAL;
 
-    if (cur == NULL || vd == NULL) {
-        return EINVAL;
+    ByteCursor_t *cursor = cursor_fork(cur);
+    if (cursor == NULL) {
+        err = ENOMEM;
+        goto cleanup;
     }
 
-    ByteCursor_t cursor = *cur;
-
-    memset(vd, 0, sizeof(*vd));
+    VolDescriptor_t tempVD = {0};
 
     // Filling the header of struct VolumeDescriptor_t
-    errno_t err;
+    err = getDescriptorHeader(&tempVD.header, cursor);
+    if (err != 0) goto cleanup;
 
-    READ_VALUE(vd->header.type,     cursor, err);
-    READ_FIELD(vd->header.id,       cursor, err);
-    READ_VALUE(vd->header.version,  cursor, err);
-
-    if (memcmp(vd->header.id, "CD001", 5) != 0) {
-        return EINVAL;
+    if (memcmp(tempVD.header.id, "CD001", 5) != 0) {
+       err = EINVAL;
+       goto cleanup;
     }
 
-    if (vd->header.version != 1) {
-        return EINVAL;
+    if (tempVD.header.version != 1) {
+        err = EINVAL;
+        goto cleanup;
     }
 
+    err = getDescriptorData(&tempVD.data, tempVD.header.type, cursor);
+    if (err != 0) goto cleanup;
 
-    switch (vd->header.type) {
-        case DESCRIPTOR_BOOT_RECORD:
-            err = getBootRecordVD(
-                &vd->data.boot_record,
-                &cursor
-            );
+    err = cursor_merge(cur, cursor);
+    if (err != 0) goto cleanup;
 
-            if (err != 0) {
-                return err;
-            }
-            break;
+    *vd = tempVD;
 
-        case DESCRIPTOR_PRIMARY:
-            err = getPrimaryVD(
-                &vd->data.primary,
-                &cursor
-            );
-
-            if (err != 0) {
-                return err;
-            }
-            break;
-        case DESCRIPTOR_SET_TERMINATOR:
-            err = getSetTerminatorVD(
-                &vd->data.set_terminator,
-                &cursor
-            );
-
-            if (err != 0) {
-                return err;
-            }
-            break;
-
-        default:
-            return EINVAL;
-    }
-
-    *cur = cursor;
-    return 0;
-}
-
-errno_t getBootRecordVD(
-    BootRecordDescriptor_t *boot_record,
-    ByteCursor_t *cur
-) {
-    if (cur == NULL || boot_record == NULL) {
-        return EINVAL;
-    }
-
-    ByteCursor_t cursor = *cur;
-
-    // Filling the struct BootRecord_t
-    errno_t err;
-
-    READ_FIELD(boot_record->boot_system_id,     cursor, err);
-    READ_FIELD(boot_record->boot_id,            cursor, err);
-    READ_FIELD(boot_record->boot_system_use,    cursor, err);
-
-    *cur = cursor;
-    return 0;
-}
-
-errno_t getPrimaryVD(
-    PrimaryDescriptor_t *primary,
-    ByteCursor_t *cur
-) {
-    if (cur == NULL || primary == NULL) {
-        return EINVAL;
-    }
-
-    ByteCursor_t cursor = *cur;
-
-    // Filling the struct PrimaryDescryptor_t
-    errno_t err;
-
-    READ_VALUE(primary->_unused1,                       cursor, err);
-    READ_FIELD(primary->system_id,                      cursor, err);
-    READ_FIELD(primary->v_id,                           cursor, err);
-    READ_FIELD(primary->_unused2,                       cursor, err);
-    READ_FIELD(primary->v_space_size,                   cursor, err);
-    READ_FIELD(primary->_unused3,                       cursor, err);
-    READ_FIELD(primary->v_set_size,                     cursor, err);
-    READ_FIELD(primary->v_sequence_number,              cursor, err);
-    READ_FIELD(primary->logical_block_size,             cursor, err);
-    READ_FIELD(primary->path_table_size,                cursor, err);
-    READ_FIELD(primary->location_typeL_path_table,      cursor, err);
-    READ_FIELD(primary->location_opt_typeL_path_table,  cursor, err);
-    READ_FIELD(primary->location_typeM_path_table,      cursor, err);
-    READ_FIELD(primary->location_opt_typeM_path_table,  cursor, err);
-    READ_FIELD(primary->direntry_root,                  cursor, err);
-    READ_FIELD(primary->v_set_id,                       cursor, err);
-    READ_FIELD(primary->publisher_id,                   cursor, err);
-    READ_FIELD(primary->data_preparer_id,               cursor, err);
-    READ_FIELD(primary->application_id,                 cursor, err);
-    READ_FIELD(primary->copyright_file_id,              cursor, err);
-    READ_FIELD(primary->abstract_file_id,               cursor, err);
-    READ_FIELD(primary->biographic_file_id,             cursor, err);
-    READ_FIELD(primary->v_creation_date_time,           cursor, err);
-    READ_FIELD(primary->v_modification_date_time,       cursor, err);
-    READ_FIELD(primary->v_expiration_date_time,         cursor, err);
-    READ_FIELD(primary->v_effective_date_time,          cursor, err);
-    READ_VALUE(primary->file_structure_version,         cursor, err);
-    READ_VALUE(primary->_unused4,                       cursor, err);
-    READ_FIELD(primary->application_used,               cursor, err);
-    READ_FIELD(primary->reserved,                       cursor, err);
-
-    *cur = cursor;
-    return 0;
-}
-
-errno_t getSetTerminatorVD(
-    SetTerminatorDescriptor_t *set_terminator,
-    ByteCursor_t *cur
-) {
-    if (cur == NULL || set_terminator == NULL) {
-        return EINVAL;
-    }
-
-    ByteCursor_t cursor = *cur;
-
-    // Filling the struct PrimaryDescryptor_t
-    errno_t err;
-
-    READ_FIELD(set_terminator->_unused, cursor, err);
-
-    *cur = cursor;
-    return 0;
+    cleanup:
+    cursor_close(cursor);
+    return err;
 }

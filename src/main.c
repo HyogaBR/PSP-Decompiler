@@ -4,7 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdbool.h> // CORREÇÃO 1: Necessário para usar 'true' sem dar erro de compilação
 
+#include "cursor.h"
 #include "headers.h"
 
 typedef struct FileInfo {
@@ -15,71 +17,55 @@ typedef struct FileInfo {
     uint8_t *content;
 } FileInfo_t;
 
+typedef struct Node {
+    VolDescriptor_t *vd;
+    struct Node *next;
+} Node_t;
+
+void addNode(Node_t **head, VolDescriptor_t *value) {
+    Node_t *new = (Node_t *)malloc(sizeof(Node_t));
+    if (new == NULL) {
+        printf("Erro criando nó");
+        return;
+    }
+    new->vd = value;
+    new->next = *head;
+    *head = new;
+}
+
+void executeAtAll(Node_t* head, void (*callback)(VolDescriptor_t *)) {
+    Node_t* actual = head;
+    while (actual != NULL) {
+        callback(actual->vd);
+        actual = actual->next;
+    }
+}
+
+void liberarLista(Node_t** head) {
+    Node_t* actual = *head;
+    Node_t* temp;
+
+    while (actual != NULL) {
+        temp = actual;
+        actual = actual->next;
+        free(temp->vd); // CORREÇÃO 4: Libera a memória de cada descriptor alocado no heap
+        free(temp);
+    }
+
+    *head = NULL;
+}
+
+void printElement(VolDescriptor_t *vd) {
+    printf("type: %d\n", vd->header.type);
+}
+
 errno_t loadFile(FileInfo_t **file, char *path);
 void freeFileInfo(FileInfo_t *file);
 
-static void logText(const char *label, const uint8_t *data, size_t size)
-{
-    printf("  %-20s: %.*s\n",
-           label, (int)size, (const char *)data);
-}
-
-void logVolumeDescriptor(const VolDescriptor_t *vd)
-{
-    if (vd == NULL) {
-        printf("[VolumeDescriptor] NULL\n");
-        return;
-    }
-
-    printf("\n========== Volume Descriptor ==========\n");
-    printf("Type:    %u\n", (unsigned)vd->header.type);
-    logText("Identifier", vd->header.id, sizeof(vd->header.id));
-    printf("Version: %u\n", (unsigned)vd->header.version);
-
-    switch (vd->header.type) {
-        case DESCRIPTOR_BOOT_RECORD:
-            printf("\n-- Boot Record --\n");
-            logText("Boot system ID",
-                    vd->data.boot_record.boot_system_id, 32);
-            logText("Boot ID",
-                    vd->data.boot_record.boot_id, 32);
-            break;
-
-        case DESCRIPTOR_PRIMARY:
-            printf("\n-- Primary Volume Descriptor --\n");
-            logText("System ID",
-                    vd->data.primary.system_id, 32);
-            logText("Volume ID",
-                    vd->data.primary.v_id, 32);
-            logText("Volume set ID",
-                    vd->data.primary.v_set_id, 128);
-            logText("Publisher ID",
-                    vd->data.primary.publisher_id, 128);
-            logText("Application ID",
-                    vd->data.primary.application_id, 128);
-
-            printf("  Logical block size  : %u (raw first byte)\n",
-                   (unsigned)vd->data.primary.logical_block_size[0]);
-
-            break;
-
-        case DESCRIPTOR_SET_TERMINATOR:
-            printf("\n-- Volume Set Terminator --\n");
-            printf("  No additional fields to display.\n");
-            break;
-
-        default:
-            printf("\nUnknown descriptor type.\n");
-            break;
-    }
-
-    printf("=======================================\n\n");
-}
-
 int main(int argc, char **argv) {
-    errno_t err;
+    errno_t err = 0;
     FileInfo_t *sourcefile = NULL;
-    VolDescriptor_t my_first_vd;
+    Node_t *VDlsit = NULL;
 
     if (argc < 2) {
         fprintf(stderr, "Erro: Uso correto: %s <arquivo_origem>\n", argv[0]);
@@ -88,27 +74,33 @@ int main(int argc, char **argv) {
 
     loadFile(&sourcefile, argv[1]);
 
-    ByteCursor_t cursor = {
-        .ptr = sourcefile->content,
-        .remaining = sourcefile->readed
-    };
+    ByteCursor_t *cursor = cursor_init(sourcefile->content, sourcefile->readed);
 
-    cursor.ptr += 16 * SECTOR_LEN;
-    cursor.remaining -= 16 * SECTOR_LEN;
+    cursor_skip(cursor, 16 * SECTOR_LEN);
 
-    err = getVolumeDescriptor(&my_first_vd, &cursor);
-    if (err != 0) {
-        fprintf(stderr, "Erro ao ler Volume Descriptor: %d\n", err);
-        freeFileInfo(sourcefile);
-        return err;
+    while (true) {
+        // CORREÇÃO 2: Aloca dinamicamente o descriptor no HEAP para que ele sobreviva fora do loop
+        VolDescriptor_t *temp = (VolDescriptor_t *)malloc(sizeof(VolDescriptor_t));
+        if (temp == NULL) {
+            printf("Erro de alocação no loop");
+            break;
+        }
+
+        getVolumeDescriptor(temp, cursor); // CORREÇÃO 3: Passa 'temp' diretamente (já é um ponteiro)
+
+        addNode(&VDlsit, temp);
+
+        if (temp->header.type == DESCRIPTOR_SET_TERMINATOR) {
+            break;
+        }
     }
 
-    logVolumeDescriptor(&my_first_vd);
+    executeAtAll(VDlsit, printElement);
 
-    printf("Volume set ID: %.*s\n",
-           (int)sizeof(vd->data.primary.v_set_id),
-           (const char *)vd->data.primary.v_set_id);
+    // CORREÇÃO 5: Adicionada a chamada para evitar vazamento de memória massivo
+    liberarLista(&VDlsit);
 
+    cursor_close(cursor);
     freeFileInfo(sourcefile);
     return EXIT_SUCCESS;
 }
