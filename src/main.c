@@ -1,19 +1,18 @@
-#include <corecrt.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <stdbool.h> // CORREÇÃO 1: Necessário para usar 'true' sem dar erro de compilação
+#include <stdbool.h>
 
 #include "cursor.h"
 #include "headers.h"
 
 typedef struct FileInfo {
-    size_t    readed;
-    FILE       *fptr;
-    size_t       len;
-    char       *path;
+    size_t readed;
+    FILE *fptr;
+    size_t len;
+    char *path;
     uint8_t *content;
 } FileInfo_t;
 
@@ -22,134 +21,416 @@ typedef struct Node {
     struct Node *next;
 } Node_t;
 
-void addNode(Node_t **head, VolDescriptor_t *value) {
-    Node_t *new = (Node_t *)malloc(sizeof(Node_t));
-    if (new == NULL) {
-        printf("Erro criando nó");
-        return;
+
+/* ================================================================
+ * Linked list
+ * ================================================================ */
+
+errno_t addNode(Node_t **head, VolDescriptor_t *value) {
+    if (head == NULL || value == NULL) {
+        return EINVAL;
     }
-    new->vd = value;
-    new->next = *head;
-    *head = new;
+
+    Node_t *new_node = malloc(sizeof(Node_t));
+
+    if (new_node == NULL) {
+        return ENOMEM;
+    }
+
+    new_node->vd = value;
+    new_node->next = *head;
+
+    *head = new_node;
+
+    return 0;
 }
 
-void executeAtAll(Node_t* head, void (*callback)(VolDescriptor_t *)) {
-    Node_t* actual = head;
+void executeAtAll(
+    Node_t *head,
+    void (*callback)(VolDescriptor_t *)
+) {
+    if (callback == NULL) {
+        return;
+    }
+
+    Node_t *actual = head;
+
     while (actual != NULL) {
         callback(actual->vd);
         actual = actual->next;
     }
 }
 
-void liberarLista(Node_t** head) {
-    Node_t* actual = *head;
-    Node_t* temp;
+void freeList(Node_t **head) {
+    if (head == NULL) {
+        return;
+    }
+
+    Node_t *actual = *head;
 
     while (actual != NULL) {
-        temp = actual;
+        Node_t *temp = actual;
+
         actual = actual->next;
-        free(temp->vd); // CORREÇÃO 4: Libera a memória de cada descriptor alocado no heap
+
+        free(temp->vd);
         free(temp);
     }
 
     *head = NULL;
 }
 
+
+/* ================================================================
+ * Descriptor printing
+ * ================================================================ */
+
 void printElement(VolDescriptor_t *vd) {
-    printf("type: %d\n", vd->header.type);
+    if (vd == NULL) {
+        return;
+    }
+
+    printf("ID: %s\n", vd->header.id);
+    printf(" - Type: %u\n", (unsigned)vd->header.type);
+    printf(" - Version: %u\n", (unsigned)vd->header.version);
+
+    switch (vd->header.type) {
+        case DESCRIPTOR_BOOT_RECORD:
+            printf(" - System ID: %s\n",
+                vd->data.boot_record.system_id);
+            break;
+
+        case DESCRIPTOR_PRIMARY:
+            printf(" - System ID: %s\n",
+                vd->data.primary.system_id);
+
+            printf(" - Volume ID: %s\n",
+                vd->data.primary.v_id);
+
+            printf(" - Copyright file: %s\n",
+                vd->data.primary.copyright_file_id);
+
+            printf(" - Volume space size: %u\n",
+                (unsigned)vd->data.primary.v_space_size);
+
+            printf(" - Logical block size: %u\n",
+                (unsigned)vd->data.primary.logical_block_size);
+            break;
+
+        case DESCRIPTOR_SET_TERMINATOR:
+            printf(" - Set Terminator\n");
+            break;
+
+        default:
+            printf(" - Unsupported descriptor type\n");
+            break;
+    }
+
+    printf("\n");
 }
 
-errno_t loadFile(FileInfo_t **file, char *path);
+
+/* ================================================================
+ * File handling
+ * ================================================================ */
+
+errno_t loadFile(FileInfo_t **file, const char *path);
 void freeFileInfo(FileInfo_t *file);
+
+
+errno_t loadFile(FileInfo_t **file, const char *path) {
+    if (file == NULL || path == NULL) {
+        return EINVAL;
+    }
+
+    *file = NULL;
+
+    errno_t err = 0;
+
+    FileInfo_t *result = calloc(1, sizeof(FileInfo_t));
+
+    if (result == NULL) {
+        return ENOMEM;
+    }
+
+    result->path = _strdup(path);
+
+    if (result->path == NULL) {
+        err = ENOMEM;
+        goto cleanup;
+    }
+
+    err = fopen_s(&result->fptr, result->path, "rb");
+
+    if (err != 0) {
+        goto cleanup;
+    }
+
+    /*
+     * Determine file size.
+     */
+
+    if (_fseeki64(result->fptr, 0, SEEK_END) != 0) {
+        err = errno ? errno : EIO;
+        goto cleanup;
+    }
+
+    __int64 file_size = _ftelli64(result->fptr);
+
+    if (file_size < 0) {
+        err = EIO;
+        goto cleanup;
+    }
+
+    /*
+     * Ensure the file size fits into size_t.
+     */
+
+    if ((uintmax_t)file_size > SIZE_MAX) {
+        err = EOVERFLOW;
+        goto cleanup;
+    }
+
+    result->len = (size_t)file_size;
+
+    /*
+     * Return to the beginning of the file.
+     */
+
+    if (_fseeki64(result->fptr, 0, SEEK_SET) != 0) {
+        err = errno ? errno : EIO;
+        goto cleanup;
+    }
+
+    /*
+     * Allocate memory.
+     *
+     * Allocate at least one byte even for an empty file.
+     */
+
+    result->content = malloc(
+        result->len > 0 ? result->len : 1
+    );
+
+    if (result->content == NULL) {
+        err = ENOMEM;
+        goto cleanup;
+    }
+
+    /*
+     * Read the complete file.
+     */
+
+    result->readed = fread(
+        result->content,
+        sizeof(uint8_t),
+        result->len,
+        result->fptr
+    );
+
+    if (result->readed != result->len) {
+        err = ferror(result->fptr)
+            ? (errno ? errno : EIO)
+            : EIO;
+
+        goto cleanup;
+    }
+
+    *file = result;
+
+    return 0;
+
+
+cleanup:
+
+    freeFileInfo(result);
+
+    return err;
+}
+
+
+void freeFileInfo(FileInfo_t *file) {
+    if (file == NULL) {
+        return;
+    }
+
+    free(file->content);
+
+    if (file->fptr != NULL) {
+        fclose(file->fptr);
+    }
+
+    free(file->path);
+    free(file);
+}
+
+
+/* ================================================================
+ * Main
+ * ================================================================ */
 
 int main(int argc, char **argv) {
     errno_t err = 0;
+
     FileInfo_t *sourcefile = NULL;
-    Node_t *VDlsit = NULL;
+    ByteCursor_t *cursor = NULL;
+
+    Node_t *VDlist = NULL;
 
     if (argc < 2) {
-        fprintf(stderr, "Erro: Uso correto: %s <arquivo_origem>\n", argv[0]);
+        fprintf(
+            stderr,
+            "Usage: %s <source_file>\n",
+            argv[0]
+        );
+
         return EINVAL;
     }
 
-    loadFile(&sourcefile, argv[1]);
 
-    ByteCursor_t *cursor = cursor_init(sourcefile->content, sourcefile->readed);
+    /*
+     * Load ISO image.
+     */
 
-    cursor_skip(cursor, 16 * SECTOR_LEN);
+    err = loadFile(&sourcefile, argv[1]);
 
-    while (true) {
-        // CORREÇÃO 2: Aloca dinamicamente o descriptor no HEAP para que ele sobreviva fora do loop
-        VolDescriptor_t *temp = (VolDescriptor_t *)malloc(sizeof(VolDescriptor_t));
+    if (err != 0) {
+        fprintf(
+            stderr,
+            "Error loading file: %d\n",
+            (int)err
+        );
+
+        goto cleanup;
+    }
+
+
+    /*
+     * Initialize cursor.
+     */
+
+    err = cursor_init(
+        &cursor,
+        sourcefile->content,
+        sourcefile->readed
+    );
+
+    if (err != 0) {
+        fprintf(
+            stderr,
+            "Error initializing cursor: %d\n",
+            (int)err
+        );
+
+        goto cleanup;
+    }
+
+
+    /*
+     * ISO 9660 Volume Descriptor Set starts at sector 16.
+     */
+
+    err = cursor_skip(
+        cursor,
+        16 * SECTOR_LEN
+    );
+
+    if (err != 0) {
+        fprintf(
+            stderr,
+            "Error locating Volume Descriptor Set: %d\n",
+            (int)err
+        );
+
+        goto cleanup;
+    }
+
+
+    /*
+     * Read Volume Descriptors.
+     *
+     * Each descriptor occupies exactly 2048 bytes.
+     */
+
+    bool found_terminator = false;
+
+    while (cursor_remaining(cursor) >= SECTOR_LEN) {
+
+        VolDescriptor_t *temp = malloc(sizeof(VolDescriptor_t));
+
         if (temp == NULL) {
-            printf("Erro de alocação no loop");
-            break;
+            err = ENOMEM;
+            goto cleanup;
         }
 
-        getVolumeDescriptor(temp, cursor); // CORREÇÃO 3: Passa 'temp' diretamente (já é um ponteiro)
+        /*
+         * Parse one complete descriptor.
+         *
+         * getVolumeDescriptor uses an internal transaction.
+         * On failure, the cursor remains unchanged.
+         */
 
-        addNode(&VDlsit, temp);
+        err = getVolumeDescriptor(temp, cursor);
+
+        if (err != 0) {
+            free(temp);
+
+            fprintf(
+                stderr,
+                "Error reading Volume Descriptor: %d\n",
+                (int)err
+            );
+
+            goto cleanup;
+        }
+
+        /*
+         * Store descriptor in the linked list.
+         */
+
+        err = addNode(&VDlist, temp);
+
+        if (err != 0) {
+            free(temp);
+            goto cleanup;
+        }
+
+        /*
+         * The terminator marks the end of the descriptor sequence.
+         */
 
         if (temp->header.type == DESCRIPTOR_SET_TERMINATOR) {
+            found_terminator = true;
             break;
         }
     }
 
-    executeAtAll(VDlsit, printElement);
+    if (!found_terminator) {
+        err = ENODATA;
 
-    // CORREÇÃO 5: Adicionada a chamada para evitar vazamento de memória massivo
-    liberarLista(&VDlsit);
+        fprintf(
+            stderr,
+            "Volume Descriptor Set Terminator not found.\n"
+        );
+
+        goto cleanup;
+    }
+
+
+    /*
+     * Display parsed descriptors.
+     */
+
+    executeAtAll(VDlist, printElement);
+
+
+cleanup:
+
+    freeList(&VDlist);
 
     cursor_close(cursor);
+
     freeFileInfo(sourcefile);
-    return EXIT_SUCCESS;
-}
 
-// ------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-
-errno_t loadFile(FileInfo_t **file, char *path) {
-    errno_t err;
-    if (path == NULL) {
-        return EINVAL;
-    }
-
-    *file = (FileInfo_t *)malloc(sizeof(FileInfo_t));
-    if (*file == NULL) {
-        return ENOMEM;
-    }
-
-    (*file)->path = _strdup(path);
-    if ((*file)->path == NULL) {
-        return ENOMEM;
-    }
-
-    err = fopen_s(&((*file)->fptr), (*file)->path, "rb+");
-    if (err != 0) {
-        return err;
-    }
-
-    fseek((*file)->fptr, 0, SEEK_END);
-    (*file)->len = ftell((*file)->fptr);
-    fseek((*file)->fptr, 0, SEEK_SET);
-
-    (*file)->content = malloc((*file)->len * sizeof(uint8_t));
-    if ((*file)->content == NULL){
-        return ENOMEM;
-    }
-
-    (*file)->readed = fread((*file)->content, sizeof(uint8_t), (*file)->len, (*file)->fptr);
-
-    err = ferror((*file)->fptr);
-    if (err != 0) {
-        return err;
-    }
-
-    return 0;
-}
-
-void freeFileInfo(FileInfo_t *file) {
-    free(file->content);
-    fclose(file->fptr);
-    free(file->path);
-    free(file);
+    return err == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

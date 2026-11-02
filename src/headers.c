@@ -1,288 +1,629 @@
 #include <errno.h>
-#include <stdint.h>
 #include <string.h>
 
 #include "headers.h"
-#include "cursor.h"
 
-#define READ_VALUE(dst, cursor, err)                                    \
-    do {                                                                \
-        (err) = cursor_read((cursor), sizeof((dst)), (byte *)&(dst));   \
-        if ((err) != 0) goto cleanup;                                     \
-    } while (0)
+/*
+ * Compile-time validation of the ISO binary structures.
+ *
+ * If one of these assertions fails, the binary structures do not
+ * represent the expected ISO 9660 layout.
+ */
 
-#define COPY_VALUE(dst, src, err)                               \
-    do {                                                        \
-    memset(&(dst), 0, sizeof((dst)));                           \
-    (err) = memcpy_s(&(dst), sizeof(dst), &(src), sizeof(src)); \
-    if ((err) != 0) goto cleanup;                                 \
-    } while(0)
+_Static_assert(
+    sizeof(DescriptorHeaderISO_t) == ISO_DESCRIPTOR_HEADER_SIZE,
+    "Invalid ISO descriptor header size"
+);
+
+_Static_assert(
+    sizeof(DescriptorDateTimeISO_t) == 17,
+    "Invalid ISO date/time size"
+);
+
+_Static_assert(
+    sizeof(BootRecordDescriptorISO_t) == ISO_DESCRIPTOR_DATA_SIZE,
+    "Invalid ISO boot record size"
+);
+
+_Static_assert(
+    sizeof(PrimaryDescriptorISO_t) == ISO_DESCRIPTOR_DATA_SIZE,
+    "Invalid ISO primary descriptor size"
+);
+
+_Static_assert(
+    sizeof(SetTerminatorDescriptorISO_t) == ISO_DESCRIPTOR_DATA_SIZE,
+    "Invalid ISO set terminator size"
+);
+
+_Static_assert(
+    sizeof(DescriptorDataISO_t) == ISO_DESCRIPTOR_DATA_SIZE,
+    "Invalid ISO descriptor data size"
+);
 
 
-errno_t getDescriptorHeaderISO(
-    DescriptorHeaderISO_t *header,
-    ByteCursor_t *cur
+/* ================================================================
+ * Internal helpers
+ * ================================================================ */
+
+/*
+ * Copies a fixed-size ISO field into a C string.
+ *
+ * ISO fields are not necessarily null-terminated.
+ * The destination always receives a terminating '\0'.
+ */
+static void copyFixedString(
+    char *dst,
+    const char *src,
+    size_t size
 ) {
-    errno_t err = 0;
-    if (header == NULL || cur == NULL) return EINVAL;
-
-    ByteCursor_t *cursor = cursor_fork(cur);
-    if (cursor == NULL) {
-        err = ENOMEM;
-        goto cleanup;
-    }
-
-    READ_VALUE(*header, cursor, err);
-
-    err = cursor_merge(cur, cursor);
-
-    cleanup:
-    cursor_close(cursor);
-    return err;
+    memcpy(dst, src, size);
+    dst[size] = '\0';
 }
 
-errno_t getDescriptorDataISO(
-    DescriptorDataISO_t *data,
-    DescriptorType_t dataType,
-    ByteCursor_t *cur
-) {
-    errno_t err = 0;
-    if (data == NULL || cur == NULL) return EINVAL;
 
-    ByteCursor_t *cursor = cursor_fork(cur);
-    if (cursor == NULL) {
-        err = ENOMEM;
-        goto cleanup;
+/*
+ * Converts a little-endian byte sequence into a host uint16_t.
+ *
+ * This does not depend on the host machine's endianness.
+ */
+static uint16_t decodeLE16(const uint8_t *src) {
+    return
+        ((uint16_t)src[0]) |
+        ((uint16_t)src[1] << 8);
+}
+
+
+/*
+ * Converts a little-endian byte sequence into a host uint32_t.
+ */
+static uint32_t decodeLE32(const uint8_t *src) {
+    return
+        ((uint32_t)src[0]) |
+        ((uint32_t)src[1] << 8) |
+        ((uint32_t)src[2] << 16) |
+        ((uint32_t)src[3] << 24);
+}
+
+
+/*
+ * Converts a big-endian byte sequence into a host uint32_t.
+ */
+static uint32_t decodeBE32(const uint8_t *src) {
+    return
+        ((uint32_t)src[0] << 24) |
+        ((uint32_t)src[1] << 16) |
+        ((uint32_t)src[2] << 8) |
+        ((uint32_t)src[3]);
+}
+
+
+/*
+ * Decodes a 16-bit ISO both-endian field.
+ *
+ * ISO 9660 stores the same value in little-endian and big-endian
+ * representations. A mismatch indicates malformed or inconsistent
+ * data.
+ */
+static errno_t decodeBothEndian16(
+    const uint16_t *little,
+    const uint16_t *big,
+    uint16_t *out
+) {
+    if (little == NULL || big == NULL || out == NULL) {
+        return EINVAL;
     }
 
-    switch (dataType) {
+    const uint8_t *little_bytes = (const uint8_t *)little;
+    const uint8_t *big_bytes = (const uint8_t *)big;
+
+    uint16_t little_value = decodeLE16(little_bytes);
+    uint16_t big_value = (uint16_t)(
+        ((uint16_t)big_bytes[0] << 8) |
+        ((uint16_t)big_bytes[1])
+    );
+
+    if (little_value != big_value) {
+        return EILSEQ;
+    }
+
+    *out = little_value;
+
+    return 0;
+}
+
+
+/*
+ * Decodes a 32-bit ISO both-endian field.
+ */
+static errno_t decodeBothEndian32(
+    const uint32_t *little,
+    const uint32_t *big,
+    uint32_t *out
+) {
+    if (little == NULL || big == NULL || out == NULL) {
+        return EINVAL;
+    }
+
+    uint32_t little_value = decodeLE32(
+        (const uint8_t *)little
+    );
+
+    uint32_t big_value = decodeBE32(
+        (const uint8_t *)big
+    );
+
+    if (little_value != big_value) {
+        return EILSEQ;
+    }
+
+    *out = little_value;
+
+    return 0;
+}
+
+
+/* ================================================================
+ * Date/time conversion
+ * ================================================================ */
+
+static void convertDescriptorDateTime(
+    DescriptorDateTime_t *dst,
+    const DescriptorDateTimeISO_t *src
+) {
+    copyFixedString(dst->year, src->year, 4);
+    copyFixedString(dst->month, src->month, 2);
+    copyFixedString(dst->day, src->day, 2);
+    copyFixedString(dst->hour, src->hour, 2);
+    copyFixedString(dst->minute, src->minute, 2);
+    copyFixedString(dst->second, src->second, 2);
+    copyFixedString(dst->hundredsec, src->hundredsec, 2);
+
+    dst->timezone = src->timezone;
+}
+
+
+/* ================================================================
+ * Header conversion
+ * ================================================================ */
+
+static void convertDescriptorHeader(
+    DescriptorHeader_t *dst,
+    const DescriptorHeaderISO_t *src
+) {
+    dst->type = src->type;
+
+    copyFixedString(dst->id, src->id, sizeof(src->id));
+
+    dst->version = src->version;
+}
+
+
+/* ================================================================
+ * Boot record conversion
+ * ================================================================ */
+
+static void convertBootRecord(
+    BootRecordDescriptor_t *dst,
+    const BootRecordDescriptorISO_t *src
+) {
+    copyFixedString(
+        dst->system_id,
+        src->system_id,
+        sizeof(src->system_id)
+    );
+
+    copyFixedString(
+        dst->id,
+        src->id,
+        sizeof(src->id)
+    );
+
+    memcpy(
+        dst->system_use,
+        src->system_use,
+        sizeof(dst->system_use)
+    );
+}
+
+
+/* ================================================================
+ * Primary descriptor conversion
+ * ================================================================ */
+
+static errno_t convertPrimaryDescriptor(
+    PrimaryDescriptor_t *dst,
+    const PrimaryDescriptorISO_t *src
+) {
+    errno_t err;
+
+    /*
+     * Text fields.
+     */
+
+    copyFixedString(
+        dst->system_id,
+        src->system_id,
+        sizeof(src->system_id)
+    );
+
+    copyFixedString(
+        dst->v_id,
+        src->v_id,
+        sizeof(src->v_id)
+    );
+
+    copyFixedString(
+        dst->v_set_id,
+        src->v_set_id,
+        sizeof(src->v_set_id)
+    );
+
+    copyFixedString(
+        dst->publisher_id,
+        src->publisher_id,
+        sizeof(src->publisher_id)
+    );
+
+    copyFixedString(
+        dst->data_preparer_id,
+        src->data_preparer_id,
+        sizeof(src->data_preparer_id)
+    );
+
+    copyFixedString(
+        dst->application_id,
+        src->application_id,
+        sizeof(src->application_id)
+    );
+
+    copyFixedString(
+        dst->copyright_file_id,
+        src->copyright_file_id,
+        sizeof(src->copyright_file_id)
+    );
+
+    copyFixedString(
+        dst->abstract_file_id,
+        src->abstract_file_id,
+        sizeof(src->abstract_file_id)
+    );
+
+    copyFixedString(
+        dst->biographic_file_id,
+        src->biographic_file_id,
+        sizeof(src->biographic_file_id)
+    );
+
+
+    /*
+     * Both-endian numeric fields.
+     */
+
+    err = decodeBothEndian32(
+        &src->v_space_size,
+        &src->__v_space_size_msb,
+        &dst->v_space_size
+    );
+
+    if (err != 0) {
+        return err;
+    }
+
+    err = decodeBothEndian16(
+        &src->v_set_size,
+        &src->__v_set_size_msb,
+        &dst->v_set_size
+    );
+
+    if (err != 0) {
+        return err;
+    }
+
+    err = decodeBothEndian16(
+        &src->v_sequence_number,
+        &src->__v_sequence_number_msb,
+        &dst->v_sequence_number
+    );
+
+    if (err != 0) {
+        return err;
+    }
+
+    err = decodeBothEndian16(
+        &src->logical_block_size,
+        &src->__logical_block_size_msb,
+        &dst->logical_block_size
+    );
+
+    if (err != 0) {
+        return err;
+    }
+
+    err = decodeBothEndian32(
+        &src->path_table_size,
+        &src->__path_table_size_msb,
+        &dst->path_table_size
+    );
+
+    if (err != 0) {
+        return err;
+    }
+
+
+    /*
+     * Path table locations.
+     *
+     * Type L locations are little-endian.
+     * Type M locations are big-endian.
+     */
+
+    dst->location_typeL_path_table = decodeLE32(
+        (const uint8_t *)&src->location_typeL_path_table
+    );
+
+    dst->location_opt_typeL_path_table = decodeLE32(
+        (const uint8_t *)&src->location_opt_typeL_path_table
+    );
+
+    dst->location_typeM_path_table = decodeBE32(
+        (const uint8_t *)&src->location_typeM_path_table
+    );
+
+    dst->location_opt_typeM_path_table = decodeBE32(
+        (const uint8_t *)&src->location_opt_typeM_path_table
+    );
+
+
+    /*
+     * Raw directory record.
+     *
+     * We will parse this structure in a later step.
+     */
+
+    memcpy(
+        dst->direntry_root,
+        src->direntry_root,
+        sizeof(dst->direntry_root)
+    );
+
+
+    /*
+     * Date/time fields.
+     */
+
+    convertDescriptorDateTime(
+        &dst->v_creation_date_time,
+        &src->v_creation_date_time
+    );
+
+    convertDescriptorDateTime(
+        &dst->v_modification_date_time,
+        &src->v_modification_date_time
+    );
+
+    convertDescriptorDateTime(
+        &dst->v_expiration_date_time,
+        &src->v_expiration_date_time
+    );
+
+    convertDescriptorDateTime(
+        &dst->v_effective_date_time,
+        &src->v_effective_date_time
+    );
+
+
+    /*
+     * Remaining fields.
+     */
+
+    dst->file_structure_version = src->file_structure_version;
+    dst->unused = src->_unused4;
+
+    memcpy(
+        dst->application_used,
+        src->application_used,
+        sizeof(dst->application_used)
+    );
+
+    memcpy(
+        dst->reserved,
+        src->reserved,
+        sizeof(dst->reserved)
+    );
+
+    return 0;
+}
+
+
+/* ================================================================
+ * Descriptor data conversion
+ * ================================================================ */
+
+static errno_t convertDescriptorData(
+    DescriptorData_t *dst,
+    const DescriptorDataISO_t *src,
+    uint8_t type
+) {
+    switch (type) {
         case DESCRIPTOR_BOOT_RECORD:
-            READ_VALUE(data->boot_record, cursor, err);
-            break;
-        case DESCRIPTOR_PRIMARY:
-            READ_VALUE(data->primary, cursor, err);
-            break;
-        case DESCRIPTOR_SET_TERMINATOR:
-            READ_VALUE(data->set_terminator, cursor, err);
-            break;
-        default:
-            err = EINVAL;
-            goto cleanup;
-    }
+            convertBootRecord(
+                &dst->boot_record,
+                &src->boot_record
+            );
 
-    err = cursor_merge(cur, cursor);
-
-    cleanup:
-    cursor_close(cursor);
-    return err;
-}
-
-errno_t getDescriptorDateTimeISO(
-    DescriptorDateTimeISO_t *dt,
-    ByteCursor_t *cur
-) {
-    errno_t err = 0;
-    if (dt == NULL || cur == NULL) return EINVAL;
-
-    ByteCursor_t *cursor = cursor_fork(cur);
-    if (cursor == NULL) {
-        err = ENOMEM;
-        goto cleanup;
-    }
-
-    READ_VALUE(*dt, cursor, err);
-
-    err = cursor_merge(cur, cursor);
-
-    cleanup:
-    cursor_close(cursor);
-    return err;
-}
-
-errno_t getDescriptorHeader(
-    DescriptorHeader_t *header,
-    ByteCursor_t *cur
-) {
-    errno_t err = 0;
-    if (header == NULL || cur == NULL) return EINVAL;
-
-
-    ByteCursor_t *cursor = cursor_fork(cur);
-    if (cursor == NULL) {
-        err = ENOMEM;
-        goto cleanup;
-    }
-
-    DescriptorHeaderISO_t headerISO;
-    err = getDescriptorHeaderISO(&headerISO, cursor);
-    if (err != 0) goto cleanup;
-
-    DescriptorHeader_t tempHd = {0};
-
-    COPY_VALUE(tempHd.type, headerISO.type, err);
-    COPY_VALUE(tempHd.id, headerISO.id, err);
-    COPY_VALUE(tempHd.version, headerISO.version, err);
-
-    err = cursor_merge(cur, cursor);
-    if (err != 0) goto cleanup;
-
-    *header = tempHd;
-
-    cleanup:
-    cursor_close(cursor);
-    return err;
-}
-
-errno_t getDescriptorData(
-    DescriptorData_t *data,
-    DescriptorType_t dataType,
-    ByteCursor_t *cur
-) {
-    errno_t err = 0;
-    if (data == NULL || cur == NULL) return EINVAL;
-
-    ByteCursor_t *cursor = cursor_fork(cur);
-    if (cursor == NULL) {
-        err = ENOMEM;
-        goto cleanup;
-    }
-
-    DescriptorDataISO_t dataISO;
-    err = getDescriptorDataISO(&dataISO, dataType, cursor);
-    if (err != 0) goto cleanup;
-
-    DescriptorData_t tempData = {0};
-
-    switch (dataType) {
-        case DESCRIPTOR_BOOT_RECORD:
-            COPY_VALUE(tempData.boot_record.system_id, dataISO.boot_record.system_id, err);
-            COPY_VALUE(tempData.boot_record.id, dataISO.boot_record.id, err);
-            COPY_VALUE(tempData.boot_record.system_use, dataISO.boot_record.system_use, err);
-            break;
+            return 0;
 
         case DESCRIPTOR_PRIMARY:
-            COPY_VALUE(tempData.primary.system_id, dataISO.primary.system_id, err);
-            COPY_VALUE(tempData.primary.v_id, dataISO.primary.v_id, err);
-            COPY_VALUE(tempData.primary.v_space_size, dataISO.primary.v_space_size, err);
-            COPY_VALUE(tempData.primary.v_set_size, dataISO.primary.v_set_size, err);
-            COPY_VALUE(tempData.primary.v_sequence_number, dataISO.primary.v_sequence_number, err);
-            COPY_VALUE(tempData.primary.logical_block_size, dataISO.primary.logical_block_size, err);
-            COPY_VALUE(tempData.primary.path_table_size, dataISO.primary.path_table_size, err);
-            COPY_VALUE(tempData.primary.location_path_table, dataISO.primary.location_typeL_path_table, err);
-            COPY_VALUE(tempData.primary.location_opt_path_table, dataISO.primary.location_opt_typeL_path_table, err);
-            COPY_VALUE(tempData.primary.direntry_root, dataISO.primary.direntry_root, err);
-            COPY_VALUE(tempData.primary.v_set_id, dataISO.primary.v_set_id, err);
-            COPY_VALUE(tempData.primary.publisher_id, dataISO.primary.publisher_id, err);
-            COPY_VALUE(tempData.primary.data_preparer_id, dataISO.primary.data_preparer_id, err);
-            COPY_VALUE(tempData.primary.application_id, dataISO.primary.application_id, err);
-            COPY_VALUE(tempData.primary.copyright_file_id, dataISO.primary.copyright_file_id, err);
-            COPY_VALUE(tempData.primary.abstract_file_id, dataISO.primary.abstract_file_id, err);
-            COPY_VALUE(tempData.primary.biographic_file_id, dataISO.primary.biographic_file_id, err);
-            COPY_VALUE(tempData.primary.v_creation_date_time, dataISO.primary.v_creation_date_time, err);
-            COPY_VALUE(tempData.primary.v_modification_date_time, dataISO.primary.v_modification_date_time, err);
-            COPY_VALUE(tempData.primary.v_expiration_date_time, dataISO.primary.v_expiration_date_time, err);
-            COPY_VALUE(tempData.primary.v_effective_date_time, dataISO.primary.v_effective_date_time, err);
-            COPY_VALUE(tempData.primary.file_structure_version, dataISO.primary.file_structure_version, err);
-            COPY_VALUE(tempData.primary.application_used, dataISO.primary.application_used, err);
-            COPY_VALUE(tempData.primary.reserved, dataISO.primary.reserved, err);
-            break;
+            return convertPrimaryDescriptor(
+                &dst->primary,
+                &src->primary
+            );
 
         case DESCRIPTOR_SET_TERMINATOR:
-            COPY_VALUE(tempData.set_terminator._unused, dataISO.set_terminator._unused, err);
-            break;
+            memcpy(
+                &dst->set_terminator,
+                &src->set_terminator,
+                sizeof(dst->set_terminator)
+            );
 
+            return 0;
+
+        /*
+         * Supplementary and Volume Partition descriptors are not
+         * interpreted yet.
+         *
+         * Preserve their bytes instead of stopping the parser.
+         */
         default:
-            err = EINVAL;
-            goto cleanup;
+            memcpy(
+                dst->raw,
+                src->raw,
+                ISO_DESCRIPTOR_DATA_SIZE
+            );
+
+            return 0;
     }
-
-    err = cursor_merge(cur, cursor);
-    if (err != 0) goto cleanup;
-
-    *data = tempData;
-
-    cleanup:
-    cursor_close(cursor);
-    return err;
 }
 
-errno_t getDescriptorDateTime(
-    DescriptorDateTime_t *dt,
-    ByteCursor_t *cur
-) {
-    errno_t err = 0;
 
-    if (dt == NULL || cur == NULL) return EINVAL;
-
-    ByteCursor_t *cursor = cursor_fork(cur);
-    if (cursor == NULL) {
-        err = ENOMEM;
-        goto cleanup;
-    }
-
-    DescriptorDateTimeISO_t dtISO;
-    err = getDescriptorDateTimeISO(&dtISO, cursor);
-    if (err != 0) goto cleanup;
-
-    DescriptorDateTime_t tempDT = {0};
-
-    COPY_VALUE(tempDT.year, dtISO.year, err);
-    COPY_VALUE(tempDT.month, dtISO.month, err);
-    COPY_VALUE(tempDT.day, dtISO.day, err);
-    COPY_VALUE(tempDT.hour, dtISO.hour, err);
-    COPY_VALUE(tempDT.minute, dtISO.minute, err);
-    COPY_VALUE(tempDT.second, dtISO.second, err);
-    COPY_VALUE(tempDT.hundredsec, dtISO.hundredsec, err);
-    COPY_VALUE(tempDT.timezone, dtISO.timezone, err);
-
-    err = cursor_merge(cur, cursor);
-    if (err != 0) goto cleanup;
-
-    *dt = tempDT;
-
-    cleanup:
-    cursor_close(cursor);
-    return err;
-}
+/* ================================================================
+ * Public API
+ * ================================================================ */
 
 errno_t getVolumeDescriptor(
     VolDescriptor_t *vd,
     ByteCursor_t *cur
 ) {
-    errno_t err = 0;
-    if (cur == NULL || vd == NULL) return EINVAL;
+    if (vd == NULL || cur == NULL) {
+        return EINVAL;
+    }
 
-    ByteCursor_t *cursor = cursor_fork(cur);
-    if (cursor == NULL) {
-        err = ENOMEM;
+    errno_t err = 0;
+
+    ByteCursor_t *transaction = NULL;
+
+    DescriptorHeaderISO_t iso_header = { 0 };
+    DescriptorDataISO_t iso_data = { 0 };
+
+    VolDescriptor_t result = { 0 };
+
+
+    /*
+     * Start transaction.
+     *
+     * The original cursor is not modified until commit.
+     */
+
+    err = cursor_fork(&transaction, cur);
+
+    if (err != 0) {
         goto cleanup;
     }
 
-    VolDescriptor_t tempVD = {0};
 
-    // Filling the header of struct VolumeDescriptor_t
-    err = getDescriptorHeader(&tempVD.header, cursor);
-    if (err != 0) goto cleanup;
+    /*
+     * Read the 7-byte descriptor header.
+     */
 
-    if (memcmp(tempVD.header.id, "CD001", 5) != 0) {
-       err = EINVAL;
-       goto cleanup;
+    err = cursor_read(
+        transaction,
+        &iso_header,
+        sizeof(iso_header),
+        sizeof(iso_header)
+    );
+
+    if (err != 0) {
+        goto cleanup;
     }
 
-    if (tempVD.header.version != 1) {
+
+    /*
+     * Validate descriptor identifier.
+     *
+     * A valid ISO 9660 descriptor must contain "CD001".
+     */
+
+    if (memcmp(iso_header.id, "CD001", 5) != 0) {
         err = EINVAL;
         goto cleanup;
     }
 
-    err = getDescriptorData(&tempVD.data, tempVD.header.type, cursor);
-    if (err != 0) goto cleanup;
+    if (iso_header.version != 1) {
+        err = EINVAL;
+        goto cleanup;
+    }
 
-    err = cursor_merge(cur, cursor);
-    if (err != 0) goto cleanup;
 
-    *vd = tempVD;
+    /*
+     * Read the entire 2041-byte payload.
+     *
+     * Reading the complete payload is important: even when we do not
+     * support a descriptor type, the next descriptor must begin at
+     * the correct position.
+     */
 
-    cleanup:
-    cursor_close(cursor);
+    err = cursor_read(
+        transaction,
+        iso_data.raw,
+        sizeof(iso_data.raw),
+        ISO_DESCRIPTOR_DATA_SIZE
+    );
+
+    if (err != 0) {
+        goto cleanup;
+    }
+
+
+    /*
+     * Convert the header.
+     */
+
+    convertDescriptorHeader(
+        &result.header,
+        &iso_header
+    );
+
+
+    /*
+     * Convert the descriptor payload.
+     */
+
+    err = convertDescriptorData(
+        &result.data,
+        &iso_data,
+        iso_header.type
+    );
+
+    if (err != 0) {
+        goto cleanup;
+    }
+
+
+    /*
+     * Commit transaction.
+     *
+     * If this fails, the original cursor remains unchanged.
+     */
+
+    err = cursor_commit(cur, transaction);
+
+    if (err != 0) {
+        goto cleanup;
+    }
+
+
+    /*
+     * Only publish the result after the transaction succeeds.
+     */
+
+    *vd = result;
+
+
+cleanup:
+
+    if (transaction != NULL) {
+        cursor_close(transaction);
+    }
+
     return err;
 }
