@@ -1,3 +1,6 @@
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,14 +10,6 @@
 
 #include "cursor.h"
 #include "headers.h"
-
-typedef struct FileInfo {
-    size_t readed;
-    FILE *fptr;
-    size_t len;
-    char *path;
-    uint8_t *content;
-} FileInfo_t;
 
 typedef struct Node {
     VolDescriptor_t *vd;
@@ -131,273 +126,115 @@ void printElement(VolDescriptor_t *vd) {
 
 
 /* ================================================================
- * File handling
- * ================================================================ */
-
-errno_t loadFile(FileInfo_t **file, const char *path);
-void freeFileInfo(FileInfo_t *file);
-
-
-errno_t loadFile(FileInfo_t **file, const char *path) {
-    if (file == NULL || path == NULL) {
-        return EINVAL;
-    }
-
-    *file = NULL;
-
-    errno_t err = 0;
-
-    FileInfo_t *result = calloc(1, sizeof(FileInfo_t));
-
-    if (result == NULL) {
-        return ENOMEM;
-    }
-
-    result->path = _strdup(path);
-
-    if (result->path == NULL) {
-        err = ENOMEM;
-        goto cleanup;
-    }
-
-    err = fopen_s(&result->fptr, result->path, "rb");
-
-    if (err != 0) {
-        goto cleanup;
-    }
-
-    /*
-     * Determine file size.
-     */
-
-    if (_fseeki64(result->fptr, 0, SEEK_END) != 0) {
-        err = errno ? errno : EIO;
-        goto cleanup;
-    }
-
-    __int64 file_size = _ftelli64(result->fptr);
-
-    if (file_size < 0) {
-        err = EIO;
-        goto cleanup;
-    }
-
-    /*
-     * Ensure the file size fits into size_t.
-     */
-
-    if ((uintmax_t)file_size > SIZE_MAX) {
-        err = EOVERFLOW;
-        goto cleanup;
-    }
-
-    result->len = (size_t)file_size;
-
-    /*
-     * Return to the beginning of the file.
-     */
-
-    if (_fseeki64(result->fptr, 0, SEEK_SET) != 0) {
-        err = errno ? errno : EIO;
-        goto cleanup;
-    }
-
-    /*
-     * Allocate memory.
-     *
-     * Allocate at least one byte even for an empty file.
-     */
-
-    result->content = malloc(
-        result->len > 0 ? result->len : 1
-    );
-
-    if (result->content == NULL) {
-        err = ENOMEM;
-        goto cleanup;
-    }
-
-    /*
-     * Read the complete file.
-     */
-
-    result->readed = fread(
-        result->content,
-        sizeof(uint8_t),
-        result->len,
-        result->fptr
-    );
-
-    if (result->readed != result->len) {
-        err = ferror(result->fptr)
-            ? (errno ? errno : EIO)
-            : EIO;
-
-        goto cleanup;
-    }
-
-    *file = result;
-
-    return 0;
-
-
-cleanup:
-
-    freeFileInfo(result);
-
-    return err;
-}
-
-
-void freeFileInfo(FileInfo_t *file) {
-    if (file == NULL) {
-        return;
-    }
-
-    free(file->content);
-
-    if (file->fptr != NULL) {
-        fclose(file->fptr);
-    }
-
-    free(file->path);
-    free(file);
-}
-
-
-/* ================================================================
  * Main
  * ================================================================ */
 
-int main(int argc, char **argv) {
+int wmain(int argc, wchar_t **argv) {
     errno_t err = 0;
 
-    FileInfo_t *sourcefile = NULL;
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+    HANDLE hMap = NULL;
+
+    const byte *sourcefile = NULL;
     ByteCursor_t *cursor = NULL;
 
     Node_t *VDlist = NULL;
 
     if (argc < 2) {
-        fprintf(
+        fwprintf(
             stderr,
-            "Usage: %s <source_file>\n",
+            L"Usage: %ls <source_file>\n",
             argv[0]
         );
 
         return EINVAL;
     }
 
-
-    /*
-     * Load ISO image.
-     */
-
-    err = loadFile(&sourcefile, argv[1]);
-
-    if (err != 0) {
-        fprintf(
-            stderr,
-            "Error loading file: %d\n",
-            (int)err
-        );
-
+    // create mapping
+    hFile = CreateFileW(
+        argv[1],
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (hFile == INVALID_HANDLE_VALUE) {
+        err = (errno_t)GetLastError();
         goto cleanup;
     }
 
+    LARGE_INTEGER size;
+    if (!GetFileSizeEx(hFile, &size)) {
+        err = (errno_t)GetLastError();
+        goto cleanup;
+    }
 
-    /*
-     * Initialize cursor.
-     */
+    if (size.QuadPart <= 0 ||
+        (uint64_t)size.QuadPart > SIZE_MAX) {
+        err = EINVAL;
+        goto cleanup;
+    }
+
+    hMap = CreateFileMappingW(
+        hFile,
+        NULL,
+        PAGE_READONLY,
+        0, 0,
+        NULL
+    );
+    if (hMap == NULL) {
+        err = (errno_t)GetLastError();
+        goto cleanup;
+    }
+
+    sourcefile = MapViewOfFile(
+        hMap,
+        FILE_MAP_READ,
+        0, 0, 0
+    );
+    if (sourcefile == NULL) {
+        err = (errno_t)GetLastError();
+        goto cleanup;
+    }
 
     err = cursor_init(
         &cursor,
-        sourcefile->content,
-        sourcefile->readed
+        sourcefile,
+        (size_t)size.QuadPart
     );
+    if (err != 0) goto cleanup;
 
-    if (err != 0) {
-        fprintf(
-            stderr,
-            "Error initializing cursor: %d\n",
-            (int)err
-        );
-
-        goto cleanup;
-    }
-
+    err = cursor_skip(cursor, 16 * SECTOR_LEN);
+    if (err != 0) goto cleanup;
 
     /*
-     * ISO 9660 Volume Descriptor Set starts at sector 16.
-     */
-
-    err = cursor_skip(
-        cursor,
-        16 * SECTOR_LEN
-    );
-
-    if (err != 0) {
-        fprintf(
-            stderr,
-            "Error locating Volume Descriptor Set: %d\n",
-            (int)err
-        );
-
-        goto cleanup;
-    }
-
-
-    /*
-     * Read Volume Descriptors.
-     *
-     * Each descriptor occupies exactly 2048 bytes.
-     */
+    * Read Volume Descriptors.
+    *
+    * Each descriptor occupies exactly 2048 bytes.
+    */
 
     bool found_terminator = false;
 
     while (cursor_remaining(cursor) >= SECTOR_LEN) {
-
         VolDescriptor_t *temp = malloc(sizeof(VolDescriptor_t));
-
         if (temp == NULL) {
             err = ENOMEM;
             goto cleanup;
         }
 
-        /*
-         * Parse one complete descriptor.
-         *
-         * getVolumeDescriptor uses an internal transaction.
-         * On failure, the cursor remains unchanged.
-         */
-
         err = getVolumeDescriptor(temp, cursor);
-
         if (err != 0) {
             free(temp);
-
-            fprintf(
-                stderr,
-                "Error reading Volume Descriptor: %d\n",
-                (int)err
-            );
-
             goto cleanup;
         }
-
-        /*
-         * Store descriptor in the linked list.
-         */
 
         err = addNode(&VDlist, temp);
-
         if (err != 0) {
             free(temp);
             goto cleanup;
         }
-
-        /*
-         * The terminator marks the end of the descriptor sequence.
-         */
 
         if (temp->header.type == DESCRIPTOR_SET_TERMINATOR) {
             found_terminator = true;
@@ -405,32 +242,27 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (!found_terminator) {
-        err = ENODATA;
-
-        fprintf(
-            stderr,
-            "Volume Descriptor Set Terminator not found.\n"
-        );
-
-        goto cleanup;
-    }
-
-
-    /*
-     * Display parsed descriptors.
-     */
+    if (!found_terminator) goto cleanup;
 
     executeAtAll(VDlist, printElement);
 
+    cleanup:
 
-cleanup:
+    if (cursor != NULL) {
+        cursor_close(cursor);
+    }
 
-    freeList(&VDlist);
+    if (sourcefile != NULL) {
+        UnmapViewOfFile(sourcefile);
+    }
 
-    cursor_close(cursor);
+    if (hMap != NULL) {
+        CloseHandle(hMap);
+    }
 
-    freeFileInfo(sourcefile);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        CloseHandle(hFile);
+    }
 
-    return err == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    return err;
 }
