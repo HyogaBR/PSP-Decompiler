@@ -9,6 +9,7 @@ add_executable(${PROJECT_NAME}
   src/main.c
   src/headers.c
   src/cursor.c
+  src/directories.c
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE

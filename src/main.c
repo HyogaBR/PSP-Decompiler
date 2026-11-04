@@ -10,11 +10,99 @@
 
 #include "cursor.h"
 #include "headers.h"
+#include "directories.h"
 
 typedef struct Node {
-    VolDescriptor_t *vd;
+    void *value;
     struct Node *next;
 } Node_t;
+
+typedef struct WinFile {
+    HANDLE hFile;
+    HANDLE hMap;
+    LARGE_INTEGER size;
+    const byte *ptr;
+} WinFile_t;
+
+static void closeFile(WinFile_t *file) {
+    if (file == NULL)
+        return;
+
+    if (file->ptr != NULL) {
+        UnmapViewOfFile(file->ptr);
+        file->ptr = NULL;
+    }
+
+    if (file->hMap != NULL) {
+        CloseHandle(file->hMap);
+        file->hMap = NULL;
+    }
+
+    if (file->hFile != INVALID_HANDLE_VALUE) {
+        CloseHandle(file->hFile);
+        file->hFile = INVALID_HANDLE_VALUE;
+    }
+
+    file->size.QuadPart = 0;
+}
+
+static errno_t openFile(WinFile_t *file, const wchar_t *path) {
+    if (path == NULL || file == NULL)
+        return EINVAL;
+
+    file->hFile = INVALID_HANDLE_VALUE;
+    file->hMap = NULL;
+    file->ptr = NULL;
+    file->size.QuadPart = 0;
+
+    file->hFile = CreateFileW(
+        path,
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+
+    if (file->hFile == INVALID_HANDLE_VALUE)
+        goto win_error;
+
+    if (!GetFileSizeEx(file->hFile, &file->size))
+        goto win_error;
+
+    if (file->size.QuadPart <= 0 ||
+        (uint64_t)file->size.QuadPart > SIZE_MAX) {
+        closeFile(file);
+        return EINVAL;
+    }
+
+    file->hMap = CreateFileMappingW(
+        file->hFile,
+        NULL,
+        PAGE_READONLY,
+        0, 0,
+        NULL
+    );
+
+    if (file->hMap == NULL)
+        goto win_error;
+
+    file->ptr = MapViewOfFile(
+        file->hMap,
+        FILE_MAP_READ,
+        0, 0, 0
+    );
+
+    if (file->ptr == NULL)
+        goto win_error;
+
+    return 0;
+
+win_error:
+    closeFile(file);
+    return EIO;
+}
 
 
 /* ================================================================
@@ -32,7 +120,7 @@ errno_t addNode(Node_t **head, VolDescriptor_t *value) {
         return ENOMEM;
     }
 
-    new_node->vd = value;
+    new_node->value = value;
     new_node->next = *head;
 
     *head = new_node;
@@ -42,7 +130,7 @@ errno_t addNode(Node_t **head, VolDescriptor_t *value) {
 
 void executeAtAll(
     Node_t *head,
-    void (*callback)(VolDescriptor_t *)
+    void (*callback)(void *)
 ) {
     if (callback == NULL) {
         return;
@@ -51,7 +139,7 @@ void executeAtAll(
     Node_t *actual = head;
 
     while (actual != NULL) {
-        callback(actual->vd);
+        callback(actual->value);
         actual = actual->next;
     }
 }
@@ -68,7 +156,7 @@ void freeList(Node_t **head) {
 
         actual = actual->next;
 
-        free(temp->vd);
+        free(temp->value);
         free(temp);
     }
 
@@ -80,36 +168,41 @@ void freeList(Node_t **head) {
  * Descriptor printing
  * ================================================================ */
 
-void printElement(VolDescriptor_t *vd) {
+void printElement(void *vd) {
     if (vd == NULL) {
         return;
     }
 
-    printf("ID: %s\n", vd->header.id);
-    printf(" - Type: %u\n", (unsigned)vd->header.type);
-    printf(" - Version: %u\n", (unsigned)vd->header.version);
+    VolDescriptor_t *volume = (VolDescriptor_t *)vd;
 
-    switch (vd->header.type) {
+    printf("ID: %s\n", volume->header.id);
+    printf(" - Type: %u\n", (unsigned)volume->header.type);
+    printf(" - Version: %u\n", (unsigned)volume->header.version);
+
+    switch (volume->header.type) {
         case DESCRIPTOR_BOOT_RECORD:
             printf(" - System ID: %s\n",
-                vd->data.boot_record.system_id);
+                volume->data.boot_record.system_id);
             break;
 
         case DESCRIPTOR_PRIMARY:
             printf(" - System ID: %s\n",
-                vd->data.primary.system_id);
+                volume->data.primary.system_id);
 
             printf(" - Volume ID: %s\n",
-                vd->data.primary.v_id);
+                volume->data.primary.v_id);
 
             printf(" - Copyright file: %s\n",
-                vd->data.primary.copyright_file_id);
+                volume->data.primary.copyright_file_id);
 
             printf(" - Volume space size: %u\n",
-                (unsigned)vd->data.primary.v_space_size);
+                (unsigned)volume->data.primary.v_space_size);
 
             printf(" - Logical block size: %u\n",
-                (unsigned)vd->data.primary.logical_block_size);
+                (unsigned)volume->data.primary.logical_block_size);
+
+            printf(" - Path table size: %u\n",
+                (unsigned)volume->data.primary.path_table_size);
             break;
 
         case DESCRIPTOR_SET_TERMINATOR:
@@ -124,7 +217,6 @@ void printElement(VolDescriptor_t *vd) {
     printf("\n");
 }
 
-
 /* ================================================================
  * Main
  * ================================================================ */
@@ -132,11 +224,16 @@ void printElement(VolDescriptor_t *vd) {
 int wmain(int argc, wchar_t **argv) {
     errno_t err = 0;
 
-    HANDLE hFile = INVALID_HANDLE_VALUE;
-    HANDLE hMap = NULL;
+    WinFile_t sourcefile = {
+        .hFile = INVALID_HANDLE_VALUE,
+        .hMap = NULL,
+        .size = { .QuadPart = 0 },
+        .ptr = NULL
+    };
 
-    const byte *sourcefile = NULL;
     ByteCursor_t *cursor = NULL;
+
+    VolDescriptor_t *primary = NULL;
 
     Node_t *VDlist = NULL;
 
@@ -150,59 +247,13 @@ int wmain(int argc, wchar_t **argv) {
         return EINVAL;
     }
 
-    // create mapping
-    hFile = CreateFileW(
-        argv[1],
-        GENERIC_READ,
-        FILE_SHARE_READ,
-        NULL,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        NULL
-    );
-    if (hFile == INVALID_HANDLE_VALUE) {
-        err = (errno_t)GetLastError();
-        goto cleanup;
-    }
-
-    LARGE_INTEGER size;
-    if (!GetFileSizeEx(hFile, &size)) {
-        err = (errno_t)GetLastError();
-        goto cleanup;
-    }
-
-    if (size.QuadPart <= 0 ||
-        (uint64_t)size.QuadPart > SIZE_MAX) {
-        err = EINVAL;
-        goto cleanup;
-    }
-
-    hMap = CreateFileMappingW(
-        hFile,
-        NULL,
-        PAGE_READONLY,
-        0, 0,
-        NULL
-    );
-    if (hMap == NULL) {
-        err = (errno_t)GetLastError();
-        goto cleanup;
-    }
-
-    sourcefile = MapViewOfFile(
-        hMap,
-        FILE_MAP_READ,
-        0, 0, 0
-    );
-    if (sourcefile == NULL) {
-        err = (errno_t)GetLastError();
-        goto cleanup;
-    }
+    err = openFile(&sourcefile, argv[1]);
+    if (err != 0) goto cleanup;
 
     err = cursor_init(
         &cursor,
-        sourcefile,
-        (size_t)size.QuadPart
+        sourcefile.ptr,
+        (size_t)sourcefile.size.QuadPart
     );
     if (err != 0) goto cleanup;
 
@@ -216,6 +267,7 @@ int wmain(int argc, wchar_t **argv) {
     */
 
     bool found_terminator = false;
+    bool found_primary = false;
 
     while (cursor_remaining(cursor) >= SECTOR_LEN) {
         VolDescriptor_t *temp = malloc(sizeof(VolDescriptor_t));
@@ -240,29 +292,58 @@ int wmain(int argc, wchar_t **argv) {
             found_terminator = true;
             break;
         }
+
+        if (temp->header.type == DESCRIPTOR_PRIMARY && !found_primary) {
+            found_primary = true;
+            primary = temp;
+        }
     }
 
-    if (!found_terminator) goto cleanup;
+    if (!found_terminator) {
+        err = ENODATA;
+        goto cleanup;
+    }
 
     executeAtAll(VDlist, printElement);
 
+    // Reading the Path Table
+    if (primary == NULL) {
+        err = ENODATA;
+        goto cleanup;
+    }
+
+    PathTable_t path_table = { 0 };
+
+    err = getPathTable(&path_table, cursor, primary);
+
+    if (err != 0)
+        goto cleanup;
+
+    for (size_t i = 0; i < path_table.count; i++) {
+        PathTableEntry_t *entry = &path_table.entries[i];
+
+        printf(
+            "[%zu] %s | LBA: %u | Parent: %u\n",
+            i + 1,
+            entry->dir_id,
+            (unsigned)entry->header.location_extent,
+            (unsigned)entry->header.dir_number_parent
+        );
+    }
+
     cleanup:
+
+    freePathTable(&path_table);
+
+    if (VDlist != NULL) {
+        freeList(&VDlist);
+    }
 
     if (cursor != NULL) {
         cursor_close(cursor);
     }
 
-    if (sourcefile != NULL) {
-        UnmapViewOfFile(sourcefile);
-    }
-
-    if (hMap != NULL) {
-        CloseHandle(hMap);
-    }
-
-    if (hFile != INVALID_HANDLE_VALUE) {
-        CloseHandle(hFile);
-    }
+    closeFile(&sourcefile);
 
     return err;
 }

@@ -178,6 +178,38 @@ errno_t cursor_slice(
     );
 }
 
+errno_t cursor_slice_at(
+    ByteCursor_t **out,
+    const ByteCursor_t *src,
+    size_t offset,
+    size_t size
+) {
+    if (out == NULL)
+        return EINVAL;
+
+    *out = NULL;
+
+    if (src == NULL)
+        return EINVAL;
+
+    if (offset < src->start || offset > src->limit)
+        return ERANGE;
+
+    if (size > src->limit - offset)
+        return ENODATA;
+
+    return cursor_create_view(
+        out,
+        src->buffer,
+        offset,
+        offset,
+        offset + size,
+        false,
+        0,
+        0
+    );
+}
+
 errno_t cursor_take(
     ByteCursor_t **out,
     ByteCursor_t *src,
@@ -203,7 +235,6 @@ errno_t cursor_take(
 
     return 0;
 }
-
 
 errno_t cursor_read(
     ByteCursor_t *cursor,
@@ -248,6 +279,21 @@ errno_t cursor_skip(
         return ENODATA;
 
     cursor->position += size;
+
+    return 0;
+}
+
+errno_t cursor_seek(
+    ByteCursor_t *cursor,
+    size_t offset
+) {
+    if (cursor == NULL)
+        return EINVAL;
+
+    if (offset < cursor->start || offset > cursor->limit)
+        return ERANGE;
+
+    cursor->position = offset;
 
     return 0;
 }

@@ -29,6 +29,13 @@ errno_t cursor_slice(
     size_t size
 );
 
+errno_t cursor_slice_at(
+    ByteCursor_t **out,
+    const ByteCursor_t *src,
+    size_t offset,
+    size_t size
+);
+
 errno_t cursor_take(
     ByteCursor_t **out,
     ByteCursor_t *src,
@@ -46,6 +53,11 @@ errno_t cursor_read(
 errno_t cursor_skip(
     ByteCursor_t *cursor,
     size_t size
+);
+
+errno_t cursor_seek(
+    ByteCursor_t *cursor,
+    size_t offset
 );
 
 // Transaction
