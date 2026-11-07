@@ -331,7 +331,28 @@ int wmain(int argc, wchar_t **argv) {
         );
     }
 
+    DirectoryRecord_t directory_records = { 0 };
+
+    err = getDirectoryRecords(&directory_records, cursor, primary);
+
+    if (err != 0)
+        goto cleanup;
+
+    for (size_t i = 0; i < directory_records.count; i++) {
+        DirectoryRecordEntry_t *entry = &directory_records.entries[i];
+
+        printf(
+            "%s | %s | %u bytes | LBA: %u\n",
+            entry->header.flags.is_directory ? "DIR" : "FILE",
+            entry->file_id,
+            entry->header.data_length,
+            entry->header.location_extent
+        );
+    }
+
     cleanup:
+
+    freeDirectoryRecords(&directory_records);
 
     freePathTable(&path_table);
 
